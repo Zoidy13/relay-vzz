@@ -1,345 +1,243 @@
 """
-FastAPI service for Relay: PDF účetní závěrka (VZZ) → vyplněná Excel šablona
-------------------------------------------------------------------------------
-Zjednodušený, robustní postup dle domluvy (v2 – lepší párování):
-- Do Relay nahráváš už jen relevantní stránky (VZZ) a název PDF obsahuje rok, např. "2023.pdf".
-- Běžné účetní období = rok z názvu souboru (R), Minulé účetní období = R-1.
-- Šablona: list "List1", sloupec D = názvy položek, řádek 3 sloupce E–J = roky (čísly 2019..2024 aj.).
-- Zápis probíhá pouze do roků, které v šabloně skutečně existují.
-- V2 zlepšení: čištění štítků (odstranění římských/abecedních prefixů, hvězdiček, uvozovek apod.),
-  robustnější fuzzy shoda (WRatio), synonymní slovník, ignorování šumových řádků.
-- Přidává LOG sheet s nespárovanými/ignorovanými položkami a informacemi o zpracování.
+FastAPI service: Universal PDF → Excel (editable tables) for Relay
+-------------------------------------------------------------------
+Goal
+- You upload ANY financial PDF (annual report pages, Rozvaha, VZZ, mixed).
+- The service returns an XLSX where each detected table is on its own sheet (editable cells, not images).
+- Works out of the box for PDFs with a text layer. Optional OCR mode for scanned PDFs (needs Docker deploy with system deps).
 
-Endpoint: POST /process  (multipart form)
-  - file: PDF s VZZ (název obsahuje rok, např. 2023.pdf)
-  - template: XLSX šablona (viz výše)
-  - threshold: (volitelné) int 0–100; default 76 (doporučeno 72–82 dle kvality PDF)
-  - return_log: (volitelné) bool; default True
-Vrací: vyplněný XLSX (Content-Disposition: attachment)
+Endpoints
+- POST /pdf_to_struct_xlsx   → best-effort table extraction with pdfplumber; fallback heuristic from text lines
+  Form fields: file (PDF)
+               min_cols (int, optional; default 2)  – ignore tiny 1-col fragments
+               max_sheets (int, optional; default 20)
+               include_log (bool, optional; default true)
+               ocr (bool, optional; default false)  – if true, requires Tesseract + poppler (Docker variant)
+
+Notes
+- In "ocr=false" mode the API will parse text-based PDFs robustly on Render free plan.
+- In "ocr=true" mode (for scanned PDFs) you must deploy with Docker that installs tesseract-ocr and poppler-utils.
 """
 
-import io, re, unicodedata
-from typing import List, Dict, Optional, Tuple
-from fastapi import FastAPI, File, UploadFile, HTTPException, Form
+import io, re, os, unicodedata
+from typing import List, Tuple
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import StreamingResponse
 import pdfplumber
-from openpyxl import load_workbook
-from openpyxl.worksheet.worksheet import Worksheet
-from rapidfuzz import process, fuzz
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
 
-app = FastAPI(title="Relay PDF→Excel VZZ (CZ)")
+try:
+    # Optional OCR pieces (only used when ocr=True). These imports are light; system deps are needed at runtime.
+    import pytesseract
+    from pdf2image import convert_from_bytes
+    from PIL import Image
+    OCR_AVAILABLE = True
+except Exception:
+    OCR_AVAILABLE = False
 
-YEAR_RX = re.compile(r"(20\d{2})")
-LABEL_CURRENT = re.compile(r"\b(b[eě]žn[eé]|aktu[aá]ln[íy]|current)\b", re.I)
-LABEL_PRIOR   = re.compile(r"\b(minul[eé]|srovn[aá]vac[ií]|p[řr]edchoz[ií]|prior|comparative)\b", re.I)
+app = FastAPI(title="Universal PDF→Excel (tables)")
 
-VZZ_MARKERS = [
-    "VÝKAZ ZISKU A ZTRÁTY", "VÝKAZ ZISKŮ A ZTRÁT", "Výkaz zisku a ztráty", "výkaz zisku a ztráty",
-    "výsledovka", "Výsledovka"
-]
+# ----------------- helpers -----------------
 
-# --------------------------- Helpers ---------------------------
+def nz(x):
+    return "" if x is None else str(x)
 
-def nz(s: Optional[str]) -> str:
-    return "" if s is None else str(s)
-
-def norm(s: str) -> str:
-    s = s.strip()
-    s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
-    s = re.sub(r"\s+", " ", s)
-    return s.lower()
-
-# Odstranění číslovacích prefixů (I., II., a.1, 1.2.3), odrážek, uvozovek, hvězdiček apod.
-NUM_PREFIX_RX = re.compile(r"^(?:[IVXLC]+\.|(?:\d+\.)+|\d+[a-z]?\)|[a-z]\.[0-9]+|[a-z]\)|[a-z]\.)\s*", re.I)
-JUNK_RX = re.compile(r"[\"'`´•·\*]+")
-LETTERS_RX = re.compile(r"[a-zA-Z]\w{2,}")
-
-def clean_label(s: str) -> str:
-    s = nz(s)
-    s = JUNK_RX.sub(" ", s)
-    s = NUM_PREFIX_RX.sub("", s)
+def norm_text(s: str) -> str:
+    s = unicodedata.normalize("NFKD", s)
+    s = s.encode("ascii", "ignore").decode("ascii")
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
-# Synonyma – rozšiřuj postupně dle svých PDF
-SYN = {
-    "trzby z prodeje vlastnich vyrobku a sluzeb": "tržby z prodeje vlastních výrobků a služeb",
-    "trzby za prodej zbozi": "tržby za prodej zboží",
-    "zmena stavu zasob": "změna stavu zásob vlastní činnosti",
-    "aktivace": "aktivace",
-    "naklady vynalozene na prodane zbozi": "náklady vynaložené na prodané zboží",
-    "osobni naklady": "osobní náklady",
-    "odpisy": "odpisy",
-    "dan z prijmu": "daň z příjmů",
-}
+# Extract numbers like 12 345 or (1 234) etc.
+NUM_RX = re.compile(r"\(?-?\d+(?:\s\d{3})*\)?")
 
-def apply_synonyms(s: str) -> str:
-    return SYN.get(norm(s), s)
+# ----------------- extraction -----------------
 
-# Číslo s podporou účetních závorek a různých oddělovačů
-
-def to_number(cell: str) -> Optional[float]:
-    if cell is None:
-        return None
-    s = str(cell).strip()
-    if s == "":
-        return None
-    s = s.replace("\xa0"," ").replace("\u202f"," ")
-    s = s.replace(" ", "")
-    s = s.replace("−","-")
-    s = s.replace(",", ".")
-    s = re.sub(r"[^0-9\.\-\(\)]", "", s)
-    if s in ("", "-", "--"):
-        return None
-    if s.startswith("(") and s.endswith(")"):
-        s = "-" + s[1:-1]
-    try:
-        return float(s)
-    except:
-        return None
-
-# ------------------------ Template reading ---------------------
-
-def collect_template_structure(wb_bytes: bytes):
-    wb = load_workbook(io.BytesIO(wb_bytes))
-    ws: Worksheet = wb.active  # očekáváme "List1"
-    header_row = 3
-    year_cols: Dict[int, str] = {}
-    years = []
-    for col_letter in ["E","F","G","H","I","J"]:
-        val = ws[f"{col_letter}{header_row}"].value
-        y = None
-        if isinstance(val, (int, float)) and 2000 <= int(val) <= 2100:
-            y = int(val)
-        else:
-            m = YEAR_RX.search(str(val) if val is not None else "")
-            if m:
-                y = int(m.group(1))
-        if y:
-            year_cols[y] = col_letter
-            years.append(y)
-    labels: Dict[str, int] = {}
-    for r in range(4, ws.max_row+1):
-        v = ws[f"D{r}"] .value
-        if v is None or str(v).strip()=="":
-            continue
-        labels[norm(clean_label(str(v)))] = r
-    return wb, ws, year_cols, sorted(years), labels
-
-# ------------------------ PDF utilities ------------------------
-
-def detect_vzz_pages(pdf: pdfplumber.PDF) -> List[int]:
-    hits = []
-    for i, page in enumerate(pdf.pages):
-        txt = page.extract_text() or ""
-        if any(m.lower() in txt.lower() for m in VZZ_MARKERS):
-            hits.append(i)
-    if not hits:
-        # už posíláš vyříznuté stránky – ber vše
-        return list(range(len(pdf.pages)))
-    start = hits[0]
-    end = min(len(pdf.pages)-1, start+4)
-    return list(range(start, end+1))
-
-def extract_tables_from_pages(pdf: pdfplumber.PDF, pages: List[int]) -> List[List[List[str]]]:
-    all_tables = []
-    for i in pages:
-        page = pdf.pages[i]
-        tables = page.extract_tables() or []
-        cleaned = []
-        for t in tables:
-            rows = []
-            for row in t or []:
-                if not row:
+def extract_tables_pdfplumber(pdf_bytes: bytes, min_cols: int) -> List[pd.DataFrame]:
+    tables: List[pd.DataFrame] = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for p in pdf.pages:
+            # try explicit tables
+            raw_tbls = p.extract_tables() or []
+            for t in raw_tbls:
+                rows = [[nz(c) for c in (trow or [])] for trow in t or []]
+                # simple cleanup: drop empty cols
+                if not rows:
                     continue
-                rows.append([nz(c) for c in row])
-            if rows:
-                cleaned.append(rows)
-        if not cleaned:
-            text = page.extract_text() or ""
-            lines = [l for l in text.splitlines() if l.strip()]
-            rough = [[l] for l in lines]
-            cleaned.append(rough)
-        all_tables.extend(cleaned)
+                # pad rows to same length
+                width = max(len(r) for r in rows)
+                rows = [r + [""]*(width-len(r)) for r in rows]
+                df = pd.DataFrame(rows)
+                # discard too-narrow tables
+                if df.shape[1] >= min_cols and df.shape[0] >= 2:
+                    tables.append(df)
+            # fallback: attempt to build 2-col table from lines (label | numbers...)
+            txt = p.extract_text() or ""
+            if txt:
+                lines = [l for l in txt.splitlines() if l.strip()]
+                rec = []
+                for ln in lines:
+                    # split label and trailing numbers
+                    nums = list(NUM_RX.finditer(ln))
+                    if not nums:
+                        continue
+                    # take numeric tail starting from last token; keep up to 6 numbers
+                    values = []
+                    tail = ln
+                    for m in reversed(nums):
+                        tok = m.group(0)
+                        # ensure it's at end or followed by whitespace
+                        if m.end() >= len(ln) or ln[m.end()] == " ":
+                            values.insert(0, tok)
+                            # continue collecting from previous
+                        else:
+                            break
+                    if not values:
+                        continue
+                    # label = line minus the last contiguous numbers block
+                    label = re.sub(r"\s+\(?-?\d+(?:\s\d{3})*\)?(?:\s+\(?-?\d+(?:\s\d{3})*\)?)*\s*$", "", ln).strip()
+                    row = [label] + values
+                    rec.append(row)
+                if rec:
+                    width = max(len(r) for r in rec)
+                    rec = [r + [""]*(width-len(r)) for r in rec]
+                    df = pd.DataFrame(rec)
+                    if df.shape[1] >= min_cols and df.shape[0] >= 2:
+                        tables.append(df)
+    return tables
+
+
+def extract_tables_ocr(pdf_bytes: bytes, min_cols: int) -> List[pd.DataFrame]:
+    if not OCR_AVAILABLE:
+        raise HTTPException(500, "OCR mode requested but pytesseract/pdf2image not available (deploy Docker variant).")
+    # Render each page as image, OCR to text, then heuristic table build (label | numbers...)
+    imgs = convert_from_bytes(pdf_bytes, dpi=300)
+    all_tables: List[pd.DataFrame] = []
+    for img in imgs:
+        text = pytesseract.image_to_string(img, lang="ces+eng")
+        lines = [l for l in text.splitlines() if l.strip()]
+        rec = []
+        for ln in lines:
+            nums = list(NUM_RX.finditer(ln))
+            if not nums:
+                continue
+            values = []
+            for m in reversed(nums):
+                tok = m.group(0)
+                if m.end() >= len(ln) or ln[m.end()] == " ":
+                    values.insert(0, tok)
+                else:
+                    break
+            if not values:
+                continue
+            label = re.sub(r"\s+\(?-?\d+(?:\s\d{3})*\)?(?:\s+\(?-?\d+(?:\s\d{3})*\)?)*\s*$", "", ln).strip()
+            rec.append([label] + values)
+        if rec:
+            width = max(len(r) for r in rec)
+            rec = [r + [""]*(width-len(r)) for r in rec]
+            df = pd.DataFrame(rec)
+            if df.shape[1] >= min_cols and df.shape[0] >= 2:
+                all_tables.append(df)
     return all_tables
 
-# ---------------------- Header → years map ---------------------
+# ----------------- API -----------------
 
-def map_header_to_years(header_cells: List[str], reference_year: int) -> List[Optional[int]]:
-    # 1) Explicitní roky
-    out: List[Optional[int]] = []
-    found_any_year = False
-    for c in header_cells:
-        m = YEAR_RX.search(nz(c))
-        if m:
-            out.append(int(m.group(1)))
-            found_any_year = True
-        else:
-            out.append(None)
-    if found_any_year:
-        return out
-    # 2) Role "běžné/minulé"
-    roles = []
-    for c in header_cells:
-        txt = nz(c)
-        if LABEL_CURRENT.search(txt):
-            roles.append("curr")
-        elif LABEL_PRIOR.search(txt):
-            roles.append("prev")
-        else:
-            roles.append(None)
-    mapped: List[Optional[int]] = []
-    prev_seen = 0
-    for r in roles:
-        if r == "curr":
-            mapped.append(reference_year)
-        elif r == "prev":
-            mapped.append(reference_year - 1 - prev_seen)
-            prev_seen += 1
-        else:
-            mapped.append(None)
-    return mapped
-
-# ---------------------- Harvest values -------------------------
-
-def best_match(label: str, choices: List[str]) -> Tuple[str, int]:
-    res = process.extractOne(label, choices, scorer=fuzz.WRatio)
-    if res is None:
-        return ("", 0)
-    return (res[0], int(res[1]))
-
-def harvest_items(tables: List[List[List[str]]], ref_year: int) -> Dict[int, Dict[str, float]]:
-    """Vrací {year: {normalized_label: value}}"""
-    by_year: Dict[int, Dict[str, float]] = {}
-
-    def setv(y: int, lbl: str, val: float):
-        if y not in by_year:
-            by_year[y] = {}
-        by_year[y][norm(lbl)] = val
-
-    for t in tables:
-        if not t:
-            continue
-        header = t[0]
-        header_years = map_header_to_years(header, ref_year)
-        for row in t[1:]:
-            if not row or len(row) < 2:
-                continue
-            raw_label = row[0]
-            label = apply_synonyms(clean_label(raw_label))
-            if not LETTERS_RX.search(label) or len(label) < 3:
-                continue
-            nums = [to_number(c) for c in row[1:]]
-            if all(v is None for v in nums):
-                continue
-            for idx, val in enumerate(nums):
-                if val is None:
-                    continue
-                y = header_years[idx] if idx < len(header_years) else None
-                if y is None:
-                    # heuristika: první numerický sloupec = R, další = R-1, atd.
-                    y = ref_year - idx
-                setv(int(y), label, float(val))
-    return by_year
-
-# --------------------------- API -------------------------------
-
-@app.post("/process")
-async def process_pdf(
-    file: UploadFile = File(..., description="PDF VZZ; název obsahuje rok, např. 2023.pdf"),
-    template: UploadFile = File(..., description="XLSX šablona (List1), D = názvy položek, E–J = roky"),
-    threshold: int = Form(76),
-    return_log: bool = Form(True),
+@app.post("/pdf_to_struct_xlsx")
+async def pdf_to_struct_xlsx(
+    file: UploadFile = File(..., description="PDF s tabulkami (výkazy atd.)"),
+    min_cols: int = Form(2),
+    max_sheets: int = Form(20),
+    include_log: bool = Form(True),
+    ocr: bool = Form(False),
 ):
     if not file.filename.lower().endswith(".pdf"):
-        raise HTTPException(400, "Soubor 'file' musí být PDF.")
-    if not template.filename.lower().endswith(".xlsx"):
-        raise HTTPException(400, "Soubor 'template' musí být XLSX.")
-
-    # 1) Referenční rok z názvu souboru
-    m = YEAR_RX.search(file.filename)
-    if not m:
-        raise HTTPException(400, "V názvu PDF jsem nenašel rok (např. 2023.pdf).")
-    ref_year = int(m.group(1))
+        raise HTTPException(400, "Nahraj PDF soubor.")
 
     pdf_bytes = await file.read()
-    tpl_bytes = await template.read()
 
-    # 2) Načti šablonu a známé roky/sloupce
-    wb, ws, year_cols, known_years, template_labels = collect_template_structure(tpl_bytes)
-    if not year_cols:
-        raise HTTPException(400, "V šabloně jsem nenašel roky v E–J na řádku 3.")
-
-    log_rows: List[List[str]] = []
-    def log(msg: str):
-        log_rows.append([msg])
-
-    if ref_year not in year_cols:
-        log(f"Upozornění: rok {ref_year} není v hlavičce šablony (E–J). Položky pro tento rok přeskočím.")
-    if (ref_year - 1) not in year_cols:
-        log(f"Poznámka: rok {ref_year-1} (minulé období) není v šabloně – pokud bude v PDF, přeskočím.")
-
-    # 3) PDF → tabulky
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        pages = detect_vzz_pages(pdf)
-        tables = extract_tables_from_pages(pdf, pages)
-
-    # 4) Vytěž hodnoty a roky podle hlaviček vs. ref_year
-    by_year = harvest_items(tables, ref_year)
-
-    # 5) Fuzzy párování názvů na D sloupec a zápis
-    template_keys = list(template_labels.keys())
-    filled_any = False
-    skipped = 0
-    for year, items in by_year.items():
-        target_col = year_cols.get(year)
-        if target_col is None:
-            for lbl, val in items.items():
-                skipped += 1
-                log(f"Rok {year} není v šabloně – přeskočeno: '{lbl}' = {val}")
-            continue
-        for label_pdf, value in items.items():
-            mlbl, score = best_match(norm(label_pdf), template_keys)
-            if score >= threshold:
-                row_idx = template_labels[mlbl]
-                ws[f"{target_col}{row_idx}"].value = value
-                filled_any = True
-            else:
-                skipped += 1
-                log(f"Neshoda (<{threshold}): '{label_pdf}' ~ '{mlbl}' ({score}) → {value}")
-
-    if not filled_any:
-        log("Varování: Nepodařilo se zapsat žádnou hodnotu nad zadaný threshold.")
-
-    # 6) LOG sheet
-    if return_log:
-        if "_LOG" in [s.title for s in wb.worksheets]:
-            ws_log = wb["_LOG"]
+    # 1) Extract tables
+    try:
+        if ocr:
+            tables = extract_tables_ocr(pdf_bytes, min_cols)
         else:
-            ws_log = wb.create_sheet("_LOG")
-        ws_log.append([f"Zdroj: {file.filename}"])
-        ws_log.append([f"Referenční rok (běžné období): {ref_year}"])
-        ws_log.append([f"Prahová shoda: {threshold}"])
-        ws_log.append([""])
-        ws_log.append(["Poznámky / nespárované položky:"])
-        for r in log_rows:
-            ws_log.append(r)
+            tables = extract_tables_pdfplumber(pdf_bytes, min_cols)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Chyba při parsování PDF: {e}")
 
-    # 7) Odevzdej vyplněnou šablonu
+    if not tables:
+        raise HTTPException(422, "V dokumentu jsem nenašel žádné tabulky.")
+
+    # 2) Build XLSX
+    wb = Workbook()
+    # remove default sheet; we'll create per-table
+    wb.remove(wb.active)
+
+    count = 0
+    for idx, df in enumerate(tables, start=1):
+        if count >= max_sheets:
+            break
+        # tidy: set first row as header if looks like header (contains any alphabetic label and at least one year/number)
+        df0 = df.copy()
+        df0 = df0.fillna("")
+        # normalize header
+        header = [f"col{j+1}" for j in range(df0.shape[1])]
+        df0.columns = header
+        # try to promote first row to header if it seems like column names (contains non-numeric words)
+        first = df0.iloc[0].tolist()
+        if any(re.search(r"[A-Za-z]", nz(x)) for x in first) and not all(NUM_RX.fullmatch(nz(x) or "") for x in first[1:]):
+            df0.columns = [norm_text(nz(x)) or f"col{j+1}" for j, x in enumerate(first)]
+            df0 = df0.iloc[1:]
+        title = df0.columns[0][:28] if df0.columns.size > 0 else f"Tabulka {idx}"
+        ws = wb.create_sheet(f"Tab {idx}")
+        for r in dataframe_to_rows(df0, index=False, header=True):
+            ws.append(r)
+        count += 1
+
+    if include_log:
+        log = wb.create_sheet("_LOG")
+        log.append(["Zdroj PDF", file.filename])
+        log.append(["Počet tabulek", len(tables)])
+        log.append(["Použit OCR", str(bool(ocr))])
+        log.append(["Pozn.", "Listy pojmenované 'Tab 1..N' obsahují extrahované tabulky."])
+
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
+    base = os.path.splitext(os.path.basename(file.filename))[0]
     return StreamingResponse(
         out,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename=vyplnena_sablona_{ref_year}.xlsx"}
+        headers={"Content-Disposition": f"attachment; filename={base}_tables.xlsx"}
     )
 
-# ---------------------- Requirements (for reference) ----------------------
+# ----------------- requirements (reference) -----------------
+# pdfplumber
+# pandas
+# openpyxl
 # fastapi
 # uvicorn[standard]
-# pdfplumber
-# openpyxl
-# rapidfuzz
 # python-multipart
+# Optional OCR mode (Docker deploy):
+# pytesseract
+# pdf2image
+# pillow
 
+# ----------------- Dockerfile (optional for OCR mode) -----------------
+# If you need OCR on scanned PDFs, use this Dockerfile and deploy on Render with Docker.
+# Save as Dockerfile at repo root and choose Docker deploy.
+"""
+# Example Dockerfile for OCR mode:
+# FROM python:3.11-slim
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     tesseract-ocr tesseract-ocr-ces poppler-utils \
+#     && rm -rf /var/lib/apt/lists/*
+# WORKDIR /app
+# COPY requirements.txt /app/requirements.txt
+# RUN pip install --no-cache-dir -r requirements.txt
+# COPY . /app
+# ENV PORT=10000
+# CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
