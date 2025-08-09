@@ -1,24 +1,21 @@
 """
 FastAPI service for Relay: PDF účetní závěrka (VZZ) → vyplněná Excel šablona
 ------------------------------------------------------------------------------
-Zjednodušený, robustní postup dle domluvy:
+Zjednodušený, robustní postup dle domluvy (v2 – lepší párování):
 - Do Relay nahráváš už jen relevantní stránky (VZZ) a název PDF obsahuje rok, např. "2023.pdf".
 - Běžné účetní období = rok z názvu souboru (R), Minulé účetní období = R-1.
 - Šablona: list "List1", sloupec D = názvy položek, řádek 3 sloupce E–J = roky (čísly 2019..2024 aj.).
 - Zápis probíhá pouze do roků, které v šabloně skutečně existují.
-- Fuzzy párování názvů z PDF na položky ze sloupce D, s konfigurovatelným prahem (default 82).
+- V2 zlepšení: čištění štítků (odstranění římských/abecedních prefixů, hvězdiček, uvozovek apod.),
+  robustnější fuzzy shoda (WRatio), synonymní slovník, ignorování šumových řádků.
 - Přidává LOG sheet s nespárovanými/ignorovanými položkami a informacemi o zpracování.
 
 Endpoint: POST /process  (multipart form)
   - file: PDF s VZZ (název obsahuje rok, např. 2023.pdf)
   - template: XLSX šablona (viz výše)
-  - threshold: (volitelné) int 0–100; default 82
+  - threshold: (volitelné) int 0–100; default 76 (doporučeno 72–82 dle kvality PDF)
   - return_log: (volitelné) bool; default True
 Vrací: vyplněný XLSX (Content-Disposition: attachment)
-
-Pozn.: Pokud PDF obsahuje explicitní roky v hlavičce tabulky, použijí se ony. Pokud hlavička obsahuje
-       jen texty „Běžné/Minulé účetní období“, mapuje se relativně k R a R-1. Pokud není z hlavičky
-       zjistitelný rok pro některý sloupec, heuristika bere první numerický sloupec jako R, další jako R-1 atd.
 """
 
 import io, re, unicodedata
@@ -51,6 +48,35 @@ def norm(s: str) -> str:
     s = unicodedata.normalize('NFKD', s).encode('ascii', 'ignore').decode('ascii')
     s = re.sub(r"\s+", " ", s)
     return s.lower()
+
+# Odstranění číslovacích prefixů (I., II., a.1, 1.2.3), odrážek, uvozovek, hvězdiček apod.
+NUM_PREFIX_RX = re.compile(r"^(?:[IVXLC]+\.|(?:\d+\.)+|\d+[a-z]?\)|[a-z]\.[0-9]+|[a-z]\)|[a-z]\.)\s*", re.I)
+JUNK_RX = re.compile(r"[\"'`´•·\*]+")
+LETTERS_RX = re.compile(r"[a-zA-Z]\w{2,}")
+
+def clean_label(s: str) -> str:
+    s = nz(s)
+    s = JUNK_RX.sub(" ", s)
+    s = NUM_PREFIX_RX.sub("", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+# Synonyma – rozšiřuj postupně dle svých PDF
+SYN = {
+    "trzby z prodeje vlastnich vyrobku a sluzeb": "tržby z prodeje vlastních výrobků a služeb",
+    "trzby za prodej zbozi": "tržby za prodej zboží",
+    "zmena stavu zasob": "změna stavu zásob vlastní činnosti",
+    "aktivace": "aktivace",
+    "naklady vynalozene na prodane zbozi": "náklady vynaložené na prodané zboží",
+    "osobni naklady": "osobní náklady",
+    "odpisy": "odpisy",
+    "dan z prijmu": "daň z příjmů",
+}
+
+def apply_synonyms(s: str) -> str:
+    return SYN.get(norm(s), s)
+
+# Číslo s podporou účetních závorek a různých oddělovačů
 
 def to_number(cell: str) -> Optional[float]:
     if cell is None:
@@ -94,10 +120,10 @@ def collect_template_structure(wb_bytes: bytes):
             years.append(y)
     labels: Dict[str, int] = {}
     for r in range(4, ws.max_row+1):
-        v = ws[f"D{r}"].value
+        v = ws[f"D{r}"] .value
         if v is None or str(v).strip()=="":
             continue
-        labels[norm(str(v))] = r
+        labels[norm(clean_label(str(v)))] = r
     return wb, ws, year_cols, sorted(years), labels
 
 # ------------------------ PDF utilities ------------------------
@@ -177,7 +203,7 @@ def map_header_to_years(header_cells: List[str], reference_year: int) -> List[Op
 # ---------------------- Harvest values -------------------------
 
 def best_match(label: str, choices: List[str]) -> Tuple[str, int]:
-    res = process.extractOne(label, choices, scorer=fuzz.QRatio)
+    res = process.extractOne(label, choices, scorer=fuzz.WRatio)
     if res is None:
         return ("", 0)
     return (res[0], int(res[1]))
@@ -199,7 +225,10 @@ def harvest_items(tables: List[List[List[str]]], ref_year: int) -> Dict[int, Dic
         for row in t[1:]:
             if not row or len(row) < 2:
                 continue
-            label = row[0].strip()
+            raw_label = row[0]
+            label = apply_synonyms(clean_label(raw_label))
+            if not LETTERS_RX.search(label) or len(label) < 3:
+                continue
             nums = [to_number(c) for c in row[1:]]
             if all(v is None for v in nums):
                 continue
@@ -219,7 +248,7 @@ def harvest_items(tables: List[List[List[str]]], ref_year: int) -> Dict[int, Dic
 async def process_pdf(
     file: UploadFile = File(..., description="PDF VZZ; název obsahuje rok, např. 2023.pdf"),
     template: UploadFile = File(..., description="XLSX šablona (List1), D = názvy položek, E–J = roky"),
-    threshold: int = Form(82),
+    threshold: int = Form(76),
     return_log: bool = Form(True),
 ):
     if not file.filename.lower().endswith(".pdf"):
@@ -270,14 +299,14 @@ async def process_pdf(
                 log(f"Rok {year} není v šabloně – přeskočeno: '{lbl}' = {val}")
             continue
         for label_pdf, value in items.items():
-            match_label, score = best_match(norm(label_pdf), template_keys)
+            mlbl, score = best_match(norm(label_pdf), template_keys)
             if score >= threshold:
-                row_idx = template_labels[match_label]
+                row_idx = template_labels[mlbl]
                 ws[f"{target_col}{row_idx}"].value = value
                 filled_any = True
             else:
                 skipped += 1
-                log(f"Neshoda (<{threshold}): '{label_pdf}' ~ '{match_label}' ({score}) → {value}")
+                log(f"Neshoda (<{threshold}): '{label_pdf}' ~ '{mlbl}' ({score}) → {value}")
 
     if not filled_any:
         log("Varování: Nepodařilo se zapsat žádnou hodnotu nad zadaný threshold.")
@@ -314,9 +343,3 @@ async def process_pdf(
 # rapidfuzz
 # python-multipart
 
-# ---------------------- Quick run (local) ----------------------
-# uvicorn app:app --host 0.0.0.0 --port 8000
-
-# ---------------------- Relay hookup ---------------------------
-# Flow: Upload PDF (named e.g. 2023.pdf) + pass your template → HTTP POST to /process
-# Attach the binary response to an email. You can also lower 'threshold' to ~78 if máte různá pojmenování položek.
