@@ -1,6 +1,10 @@
 fastapi
 uvicorn[standard]
 pdfplumber
+pandas
 openpyxl
-rapidfuzz
 python-multipart
+# (pro OCR variantu navíc)
+pytesseract
+pdf2image
+pillow
