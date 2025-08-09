@@ -4,7 +4,3 @@ pdfplumber
 pandas
 openpyxl
 python-multipart
-# (pro OCR variantu navíc)
-pytesseract
-pdf2image
-pillow
