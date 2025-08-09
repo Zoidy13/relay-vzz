@@ -229,8 +229,21 @@ async def pdf_to_struct_xlsx(
 # ----------------- Dockerfile (optional for OCR mode) -----------------
 # If you need OCR on scanned PDFs, use this Dockerfile and deploy on Render with Docker.
 # Save as Dockerfile at repo root and choose Docker deploy.
-"""
-# Example Dockerfile for OCR mode:
+# ----------------- requirements (reference) -----------------
+# pdfplumber
+# pandas
+# openpyxl
+# fastapi
+# uvicorn[standard]
+# python-multipart
+# Optional OCR mode (Docker deploy):
+# pytesseract
+# pdf2image
+# pillow
+
+# ----------------- Dockerfile (optional for OCR mode) -----------------
+# Uložte do samostatného souboru "Dockerfile" v rootu repozitáře, ne do app.py
+# Příklad:
 # FROM python:3.11-slim
 # RUN apt-get update && apt-get install -y --no-install-recommends \
 #     tesseract-ocr tesseract-ocr-ces poppler-utils \
@@ -240,4 +253,5 @@ async def pdf_to_struct_xlsx(
 # RUN pip install --no-cache-dir -r requirements.txt
 # COPY . /app
 # ENV PORT=10000
-# CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
+# CMD ["uvicorn","app:app","--host","0.0.0.0","--port","10000"]
+
